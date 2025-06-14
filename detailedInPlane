@@ -26,19 +26,20 @@ import numpy as np
 import math
 
 tol = 1e-4
-foldAngles = np.array([30.])#
+foldAngles = np.array([1.,2.,3.,4.,5.,10.,20.,30.,45.,60.,70.,80., 85., 86.,87.,88.,89.])#
 angle = foldAngles[0]
 creaseStiffnesses = np.array([1.98])#  
+Kcr = creaseStiffnesses[0]
 numElem = [28.0]#np.arange(10,28,5)
 nel = numElem[0]
-properties = ['Ex','Ey','Gxy']#
+properties = ['Ex','Ey','Gxy','Mx','My','Txy']#
 xDisp = 0.01
 DOF = [1,2,3,4,5,6]
 for prop in properties:
-    for Kcr in creaseStiffnesses:
+    for angle in foldAngles:
         modelName = 'thetaKcr'
         modelid = 'theta'+str(angle).replace(".","_")+'noBC'
-        if prop == 'Ex' or prop == 'Ey':
+        if prop in ['Ex', 'Ey' , 'Mx', 'My','Txy']:
             x_divs = 7
             y_divs = 7
         if prop == 'Gxy':
@@ -148,9 +149,45 @@ for prop in properties:
         m.StaticStep(name='Step-1', previous='Initial', nlgeom = OFF,initialInc=0.01)
         m.FieldOutputRequest(name='F-Output-3', createStepName='Step-1', variables=('E','ENER','ELEN','ELEDEN' ))
         
+        # Create a node list
+        nodeList = [] # n is the variable for all nodes in the unit cell
+        nodeLabels = [] # Node labels of all nodes
+        nseq = []
+        for ins in a.instances.keys():
+            for i in a.instances[ins].nodes:
+                nodeList.append(i)
+                nodeLabels.append((i.label,ins))
+                
+            nseq.append(a.instances[ins].nodes)
+            
+        N = len(nodeList) # Total number of nodes
+        # Find the outer dimensions of the unit cell
+        MinX = nodeList[0].coordinates[0]; MaxX = nodeList[0].coordinates[0];
+        MinY = nodeList[0].coordinates[1]; MaxY = nodeList[0].coordinates[1];
+        MinZ = nodeList[0].coordinates[2]; MaxZ = nodeList[0].coordinates[2];
+        for i in range(0,N):
+        
+            c = nodeList[i].coordinates
+        
+            if c[0] < MinX:
+                MinX = c[0]
+            if c[0] > MaxX:
+                MaxX = c[0]
+        
+            if c[1] < MinY:
+                MinY = c[1]
+            if c[1] > MaxY:
+                MaxY = c[1]
+        
+            if c[2] < MinZ:
+                MinZ = c[2]
+            if c[2] > MaxZ:
+                MaxZ = c[2]
+
         # Reference points
         rp1 = a.ReferencePoint(point=(x_divs*2*S+1, 0.0, 0.0))
         rp2 = a.ReferencePoint(point=(x_divs*2*S+10, 0.0, 0.0))
+        rp3 = a.ReferencePoint(point=(S*x_divs, L*x_divs, H/2.0))
         # Sets
         def findVertex(vertCoord):
             for ins in a.instances.keys():
@@ -191,6 +228,27 @@ for prop in properties:
         for ins in a.instances.keys():
             objList.append(a.instances[ins].vertices.getByBoundingBox(-1,-1,-1,1,1,1))
         a.Set(vertices=tuple(objList), name="bottomLeft")
+        vertCoord = np.array([0,V/2.0,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name='bottomBack')
+        vertCoord = np.array([0,y_divs*L*2+V/2.0,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name='topBack')
+        vertCoord = np.array([0,y_divs*L,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name='centerBack')
+        objList = []
+        vertCoord = np.array([x_divs*S*2,y_divs*L*2+V/2.0,H])
+        objList.append(findVertex(vertCoord))
+        vertCoord = np.array([0,V/2.0,H])
+        objList.append(findVertex(vertCoord))
+        a.Set(vertices=objList, name='bottomBackTopFront')
+        objList = []
+        vertCoord = np.array([0,y_divs*L*2+V/2.0,H])
+        objList.append(findVertex(vertCoord))
+        vertCoord = np.array([x_divs*S*2,V/2.0,H])
+        objList.append(findVertex(vertCoord))
+        a.Set(vertices=objList, name='topBackBottomFront')
         vertCoord = np.array([x_divs*S,y_divs*L+V/2.0,H])
         objList = findVertex(vertCoord)
         a.Set(vertices=objList, name="c")
@@ -218,6 +276,11 @@ for prop in properties:
         vertCoord = np.array([(x_divs+1)*S,(y_divs+1)*L+V/2.0,0])
         objList = findVertex(vertCoord)
         a.Set(vertices=objList, name="ctr")
+        # Surface
+        objList = []
+        for ins in a.instances.keys():
+            objList.append(a.instances[ins].edges.getByBoundingBox(x_divs*2*S,0,0,x_divs*2*S+1,y_divs*2*L,H))
+        a.Surface(name='rb', side1Edges=tuple(objList))
         
         if prop == 'Ex':
             # Equations
@@ -316,6 +379,149 @@ for prop in properties:
                 m.FieldOutputRequest(name=vertex, 
                     createStepName='Step-1', variables=('U', ), frequency=LAST_INCREMENT, 
                     region=a.sets[vertex], sectionPoints=DEFAULT, position=NODES, rebar=EXCLUDE)
+        if prop == 'Mx':
+            # Expression field
+            mdb.models['thetaKcr'].ExpressionField(description='', expression=
+                '(Z-'+str(H/2.0)+')/'+str(H), localCsys=None, name='momentY')
+            # Load
+            mdb.models['thetaKcr'].ShellEdgeLoad(createStepName='Step-1', directionVector=(
+                (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)), distributionType=FIELD, field='momentY', 
+                follower=OFF, localCsys=None, magnitude=0.001, name='momentY', region=
+                mdb.models['thetaKcr'].rootAssembly.surfaces['rb'], resultant=ON, traction=
+                GENERAL)
+            # Boundary conditions, sets, constraints
+            mdb.models['thetaKcr'].DisplacementBC(amplitude=UNSET, createStepName='Initial'
+                , distributionType=UNIFORM, fieldName='', localCsys=None, name='lb', 
+                region=mdb.models['thetaKcr'].rootAssembly.sets['lb'], u1=SET, u2=UNSET, 
+                u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            mdb.models['thetaKcr'].DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'bottomLeft', region=mdb.models['thetaKcr'].rootAssembly.sets['bottomLeft'], u1=0, u2=
+                0, u3=0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            mdb.models['thetaKcr'].DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'topBack', region=mdb.models['thetaKcr'].rootAssembly.sets['topBack'], u1=UNSET, u2=
+                UNSET, u3=0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            # Output request
+            mdb.models['thetaKcr'].IntegratedOutputSection(name='rb', refPoint=Region(
+                referencePoints=(
+                mdb.models['thetaKcr'].rootAssembly.referencePoints[rp3.id], )), 
+                refPointAtCenter=ON, refPointMotion=INDEPENDENT, surface=
+                mdb.models['thetaKcr'].rootAssembly.surfaces['rb'])
+            mdb.models['thetaKcr'].HistoryOutputRequest(createStepName='Step-1', 
+                integratedOutputSection='rb', name='H-Output-4', rebar=EXCLUDE, 
+                sectionPoints=DEFAULT, variables=('SOF', 'SOM'))
+        if prop == 'My':
+            # Load
+            moment = 0.05
+            MyNodesTop = []
+            MyNodesBottom = []
+            ycoord = ((y_divs-1)*2*L+0.5*L)+V/2.0
+            for i in range(0,N):
+                c = nodeList[i].coordinates
+                if abs(c[1] - ycoord) < meshSize/2.0 and abs(c[0] - round(c[0] / S) * S) < tol:
+                    if c[2] - (MaxZ+MinZ)/2.0 > 0:
+                        MyNodesTop.append(nodeList[i])
+                        zbar = c[2] - (MaxZ+MinZ)/2.0
+                    if c[2] - (MaxZ+MinZ)/2.0 < 0:
+                        MyNodesBottom.append(nodeList[i])
+            for n in MyNodesTop:
+                F = -moment/2/zbar/len(MyNodesTop)
+                Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+                if abs(F) > 1e-7:
+                    m.ConcentratedForce(name=str(n.instanceName)+'N'+str(n.label), 
+                        createStepName='Step-1', region=Ri, cf2=F, localCsys=None)
+            for n in MyNodesBottom:
+                F = moment/2/zbar/len(MyNodesBottom)
+                Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+                if abs(F) > 1e-7:
+                    m.ConcentratedForce(name=str(n.instanceName)+'N'+str(n.label), 
+                        createStepName='Step-1', region=Ri, cf2=F, localCsys=None)
+            # # BCs
+            MyBC = []
+            MyBottomLeft = []
+            MyBottomRight = []
+            ycoord = (0.5*L)+V/2.0
+            for i in range(0,N):
+                c = nodeList[i].coordinates
+                if abs(c[1] - ycoord) < meshSize/5:
+                    MyBC.append(nodeList[i])
+                    if abs(c[0] - MinX) < meshSize*3:
+                        MyBottomLeft.append(nodeList[i])
+                    if abs(c[0] - MaxX) < meshSize*3:
+                        MyBottomRight.append(nodeList[i])
+            for n in MyBC:
+                Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+                m.DisplacementBC(name='MyBC'+n.instanceName+str(n.label), createStepName='Step-1', 
+                    region=Ri, u1=UNSET, u2=0.0, u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET, 
+                    amplitude=UNSET, fixed=OFF, distributionType=UNIFORM, fieldName='', 
+                    localCsys=None)
+            n = MyBottomLeft[0]
+            Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+            m.DisplacementBC(name='MyBottomLeft', createStepName='Step-1', 
+                region=Ri, u1=0.0, u2=0.0, u3=0.0, ur1=UNSET, ur2=UNSET, ur3=UNSET, 
+                amplitude=UNSET, fixed=OFF, distributionType=UNIFORM, fieldName='', 
+                localCsys=None)
+            n = MyBottomRight[0]
+            Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+            m.DisplacementBC(name='MyBottomRight', createStepName='Step-1', 
+                region=Ri, u1=UNSET, u2=UNSET, u3=0.0, ur1=UNSET, ur2=UNSET, ur3=UNSET, 
+                amplitude=UNSET, fixed=OFF, distributionType=UNIFORM, fieldName='', 
+                localCsys=None)
+        if prop == 'Txy':
+            # Load
+            TxyNodesTop = []
+            TxyNodesBottom = []
+            ycoord = ((y_divs-1)*2*L+0.5*L)+V/2.0
+            for i in range(0,N):
+                c = nodeList[i].coordinates
+                if abs(c[1] - ycoord) < meshSize/2.0 and abs(c[0] - round(c[0] / S) * S) < tol:
+                    if c[2] - (MaxZ+MinZ)/2.0 > 0:
+                        TxyNodesTop.append(nodeList[i])
+                        zbar = c[2] - (MaxZ+MinZ)/2.0
+                    if c[2] - (MaxZ+MinZ)/2.0 < 0:
+                        TxyNodesBottom.append(nodeList[i])
+            # BCs
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'bottomBackTopFront', region=a.sets['bottomBackTopFront'], u1=UNSET, u2=
+                UNSET, u3=1, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'topBackBottomFront', region=a.sets['topBackBottomFront'], u1=UNSET, u2=
+                UNSET, u3=0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'topBack', region=a.sets['topBack'], u1=0, u2=
+                0, u3=0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            MyBC = []
+            MyBottomLeft = []
+            MyBottomRight = []
+            ycoord = (0.5*L)+V/2.0
+            for i in range(0,N):
+                c = nodeList[i].coordinates
+                if abs(c[1] - ycoord) < meshSize/5:
+                    MyBC.append(nodeList[i])
+                    if abs(c[0] - MinX) < meshSize:
+                        MyBottomLeft.append(nodeList[i])
+                    if abs(c[0] - MaxX) < meshSize:
+                        MyBottomRight.append(nodeList[i])
+            # Output request
+            m.IntegratedOutputSection(name='rb', refPoint=Region(
+                referencePoints=(
+                a.referencePoints[rp3.id], )), 
+                refPointAtCenter=ON, refPointMotion=INDEPENDENT, surface=
+                a.surfaces['rb'])
+            m.HistoryOutputRequest(createStepName='Step-1', 
+                integratedOutputSection='rb', name='H-Output-4', rebar=EXCLUDE, 
+                sectionPoints=DEFAULT, variables=('SOF', 'SOM'))
+            for vertex in ['c','cx+','cx-','cy+','cy-','cbl','cbr','ctl','ctr']:
+                m.FieldOutputRequest(name=vertex, 
+                    createStepName='Step-1', variables=('U', ), frequency=LAST_INCREMENT, 
+                    region=a.sets[vertex], sectionPoints=DEFAULT, position=NODES, rebar=EXCLUDE)
+            m.FieldOutputRequest(name='bottomBack', 
+                createStepName='Step-1', variables=('RF', ), frequency=LAST_INCREMENT, 
+                region=a.sets['bottomBack'], sectionPoints=DEFAULT, position=NODES, rebar=EXCLUDE)
         
         ## Interaction: crease property assignment
         
@@ -699,18 +905,14 @@ Ex = []
 vyx = []
 Ey = []
 Gyx = []
-properties = ['Ex','Ey','Gxy']#
-# x_divs = 5 
-# y_divs = 5
-# xDisp = 0.01
-# foldAngles = np.array([30.])#1.,2.,3.,4.,5.,10.,20.,30.,45.,60.,70.,80
-# angle = foldAngles[0]
-# creaseStiffnesses = np.array([10.]) #1.98,0.0010 ,   0.0032 ,   0.0105 ,   0.0342 ,   0.1110  ,  0.3603 ,   1.1696 ,   3.7965 ,  12.3231 ,  40.0000
-# numElem = [28]#np.arange(5,28,5)
-# nel = numElem[0]
-for Kcr in creaseStiffnesses:
+Mx = []
+vbxy = []
+My = []
+Txy = []
+properties = ['Mx','My','Txy']#'Ex','Ey','Gxy','Mx','My','Txy'
+for angle in foldAngles:
     for prop in properties:
-        if prop == 'Ex' or prop == 'Ey':
+        if prop in ['Ex', 'Ey' , 'Mx', 'My','Txy']:
             x_divs = 7
             y_divs = 7
         if prop == 'Gxy':
@@ -739,6 +941,10 @@ for Kcr in creaseStiffnesses:
         defCoorda1 = a1.coordinates+dispField.getSubset(region=a1).values[0].data
         a2 = odb.rootAssembly.nodeSets['CTR'].nodes[0][0]
         defCoorda2 = a2.coordinates+dispField.getSubset(region=a2).values[0].data
+        a3 = odb.rootAssembly.nodeSets['CBL'].nodes[0][0]
+        defCoorda3 = a3.coordinates+dispField.getSubset(region=a3).values[0].data
+        a4 = odb.rootAssembly.nodeSets['CBR'].nodes[0][0]
+        defCoorda4 = a4.coordinates+dispField.getSubset(region=a4).values[0].data
         epsx = (defCoorda2[0]-defCoorda1[0])/(2*S)-1
         epsy = (topU2-bottomU2)/(2*L)
         for key in odb.steps['Step-1'].historyRegions.keys():
@@ -757,3 +963,49 @@ for Kcr in creaseStiffnesses:
             sigma12 = RFy/(y_divs*2*L*H)
             eps12 = xDisp/(2*x_divs*S)
             Gyx.append(RFy*x_divs*S/(y_divs*L*H*xDisp))
+        if prop == 'Mx':
+            a1 = odb.rootAssembly.nodeSets['CX-'].nodes[0][0]
+            defCoorda1 = a1.coordinates+dispField.getSubset(region=a1).values[0].data
+            a2 = odb.rootAssembly.nodeSets['C'].nodes[0][0]
+            defCoorda2 = a2.coordinates+dispField.getSubset(region=a2).values[0].data
+            a3 = odb.rootAssembly.nodeSets['CX+'].nodes[0][0]
+            defCoorda3 = a3.coordinates+dispField.getSubset(region=a3).values[0].data
+            v1 = defCoorda2-defCoorda1
+            v2 = defCoorda3-defCoorda2
+            A = np.linalg.norm(np.cross(v1,v2))/2.0
+            kppax = 4*A/(np.linalg.norm(defCoorda1-defCoorda2)*np.linalg.norm(defCoorda2-defCoorda3)*np.linalg.norm(defCoorda3-defCoorda1))
+            moment = odb.steps['Step-1'].historyRegions['Surface RB'].historyOutputs['SOM2  on section RB'].data[-1][1]
+            Mx.append(moment/(x_divs*2*S*H*kppax))
+            
+            a1 = odb.rootAssembly.nodeSets['CY-'].nodes[0][0]
+            defCoorda1 = a1.coordinates+dispField.getSubset(region=a1).values[0].data
+            a2 = odb.rootAssembly.nodeSets['C'].nodes[0][0]
+            defCoorda2 = a2.coordinates+dispField.getSubset(region=a2).values[0].data
+            a3 = odb.rootAssembly.nodeSets['CY+'].nodes[0][0]
+            defCoorda3 = a3.coordinates+dispField.getSubset(region=a3).values[0].data
+            v1 = defCoorda2-defCoorda1
+            v2 = defCoorda3-defCoorda2
+            A = np.linalg.norm(np.cross(v1,v2))/2.0
+            kppay = 4*A/(np.linalg.norm(defCoorda1-defCoorda2)*np.linalg.norm(defCoorda2-defCoorda3)*np.linalg.norm(defCoorda3-defCoorda1))
+            vbxy.append(kppay/kppax)
+        if prop == 'My':
+            moment = 0.05
+            a1 = odb.rootAssembly.nodeSets['CY-'].nodes[0][0]
+            defCoorda1 = a1.coordinates+dispField.getSubset(region=a1).values[0].data
+            a2 = odb.rootAssembly.nodeSets['C'].nodes[0][0]
+            defCoorda2 = a2.coordinates+dispField.getSubset(region=a2).values[0].data
+            a3 = odb.rootAssembly.nodeSets['CY+'].nodes[0][0]
+            defCoorda3 = a3.coordinates+dispField.getSubset(region=a3).values[0].data
+            v1 = defCoorda2-defCoorda1
+            v2 = defCoorda3-defCoorda2
+            A = np.linalg.norm(np.cross(v1,v2))/2.0
+            kppa = 4*A/(np.linalg.norm(defCoorda1-defCoorda2)*np.linalg.norm(defCoorda2-defCoorda3)*np.linalg.norm(defCoorda3-defCoorda1))
+            My.append(moment/(x_divs*2*S*H*kppa))
+        if prop == 'Txy':
+            w1 = defCoorda4[2]-defCoorda3[2]
+            w2 = defCoorda2[2]-defCoorda1[2]
+            kppa = (w2-w1)/(2*S*2*L)
+            bl = odb.rootAssembly.nodeSets['BOTTOMBACK'].nodes[0][0]
+            F = odb.steps['Step-1'].frames[-1].fieldOutputs['RF'].getSubset(region=bl).values[0].data[2]
+            moment = F*y_divs*L
+            Txy.append(moment/(y_divs*2*L*H*2*kppa))
