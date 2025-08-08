@@ -1,0 +1,1016 @@
+# -*- coding: utf-8 -*-
+"""
+Benchmark simulation of mechanical tests on finite tessellations of Miura origami
+Written by: Xuwen Li
+
+Please run the following codes in Abaqus/CAE using File > Run script and select this python file,
+or run in ABAQUS command by typing: abaqus cae noGUI=detailedMiura.py
+Results are recorded in the text file detailedProp.txt
+"""
+
+from abaqus import *
+import testUtils
+testUtils.setBackwardCompatibility()
+from abaqusConstants import *
+from caeModules import *
+import sketch
+import part
+from regionToolset import*
+import load
+from shutil import *
+from odbAccess import *
+import assembly
+from shutil import copyfile
+import os.path
+import time
+import numpy as np
+import math
+
+tol = 1e-4
+foldAngles = np.array([30.])#
+angle = foldAngles[0]
+creaseStiffnesses = np.array([1.98])#  
+Kcr = creaseStiffnesses[0]
+properties = ['Ex','Ey','Gxy','Mx','My','Txy']#
+xDisp = 0.01
+DOF = [1,2,3,4,5,6]
+for prop in properties:
+    for angle in foldAngles:
+        modelName = 'thetaKcr'
+        modelid = 'theta'+str(angle).replace(".","_")+'noBC'
+        if prop in ['Ex', 'Ey' , 'Mx', 'My','Txy']:
+            x_divs = 7
+            y_divs = 7
+        if prop == 'Gxy':
+            x_divs = 3
+            y_divs = 24
+        JobName = str(x_divs)+modelid
+        
+        ## Draw a sketch for each part
+        theta=np.pi*angle/180 #fold angle
+        gmma = 60*np.pi/180 #sector angle
+        zeta = np.arctan(np.cos(theta)*np.tan(gmma))
+        psi = np.arcsin(np.sin(theta)*np.sin(gmma))
+        panelSideLength = 20.0
+        a = 20
+        b = 20
+        meshSize = 1.0/16.0*a
+        numx = 2*x_divs
+        numy = 2*y_divs
+        H = a*np.sin(theta)*np.sin(gmma)
+        S = b*np.cos(theta)*np.tan(gmma)/np.sqrt(1+np.cos(theta)**2*np.tan(gmma)**2)
+        L = a*np.sqrt(1-np.sin(gmma)**2*np.sin(theta)**2)
+        V = b/np.sqrt(1+np.cos(theta)**2*np.tan(gmma)**2)
+        x = np.tile(S*np.arange(0,numx+1,step=1),(numy+1,1))
+        y = np.tile(L * np.arange(numy+1), (numx + 1, 1)).T
+        y[:, 1::2] += V
+        z = np.zeros_like(x)
+        z[1::2, :] = H
+        NODE = np.column_stack((x.reshape(-1, order='F'), y.reshape(-1, order='F'), z.reshape(-1, order='F')))
+        Node_idx = np.transpose(np.reshape(np.arange(NODE.shape[0]), x.shape))
+        x = NODE[:,0]
+        y = NODE[:,1]
+        z = NODE[:,2]
+        # Define crease stiffness
+        # Number of node per crease
+        nnpc = int(a/meshSize + 1)
+        # Stiffness of the crease averaged over each node
+        jStiffness = np.divide(Kcr, nnpc)
+        # Append filenames with the crease stiffness
+        HStiffness = modelid
+        # Low stiffness for the unit strain displacement field
+        UjStiffness = np.divide(1e-7, nnpc)
+        UHStiffness = modelid
+        m = mdb.Model(name = modelName)
+        a = m.rootAssembly
+        ## Material properties
+        m.Material(name='Mylar')
+        m.materials['Mylar'].Elastic(table=((4.0e3, 0.38), ))
+        m.HomogeneousShellSection(name='Section1',
+                                  material='Mylar',
+                                  thickness=0.13)
+        BDRY = np.zeros((2 * numx + 2 * numy, 2), dtype=int)
+        Lbdry = Node_idx[:, 0]
+        Rbdry = Node_idx[:, -1]
+        Bbdry = Node_idx[0, :]
+        Tbdry = Node_idx[-1, :]
+        
+        # Specify boundary
+        count = 0
+        BDRY[count:count + len(Lbdry) - 1, :] = np.column_stack((Lbdry[:-1], Lbdry[1:]))
+        count += len(Lbdry) - 1
+        BDRY[count:count + len(Bbdry) - 1, :] = np.column_stack((Bbdry[:-1], Bbdry[1:]))
+        count += len(Bbdry) - 1
+        BDRY[count:count + len(Rbdry) - 1, :] = np.column_stack((Rbdry[:-1], Rbdry[1:]))
+        count += len(Rbdry) - 1
+        BDRY[count:count + len(Tbdry) - 1, :] = np.column_stack((Tbdry[:-1], Tbdry[1:]))
+        count += len(Tbdry) - 1
+        BDRY = BDRY.flatten()
+        k = 0
+        PANEL = [None] * (numx * numy)
+        connect = {} # Node connectivity
+        for j in range(numy):
+            for i in range(numx):
+                n1 = (i) * (numy + 1) + j
+                n2 = (i + 1) * (numy + 1) + j
+                PANEL[k] = [n1, n2, n2 + 1, n1 + 1]
+                connect[k] = [n1, n2, n2 + 1, n1 + 1, n1]
+                k += 1
+        edgeList = []
+        for panel in connect.keys():
+            p = m.Part(name='Panel'+str(panel), dimensionality=THREE_D, 
+                    type=DEFORMABLE_BODY)
+            p.ReferencePoint(point=(0.0, 0.0, 0.0))
+            d1 = [0] * int(np.amax(np.array(connect.values()))+1) #list of datum points defining vertices
+            for n in connect[panel][0:-1]:
+                d1[n]=p.DatumPointByCoordinate(coords=(x[n], y[n], z[n]))
+            w = [0] * 4 #list of wires defining panel edges
+            e=p.edges
+            for n in range(len(connect[panel])-1):
+                n1 = connect[panel][n]
+                n2 = connect[panel][n+1]
+                w[n]=p.WirePolyLine(points=((p.datums[d1[n1].id], p.datums[d1[n2].id]),), mergeType=IMPRINT, meshable=ON)
+                edgeList.append([[n1,n2],panel])
+            p.ShellLoft(loftsections=((e[0], ), (e[2], )), paths=((e[1], ), (e[3], )), 
+                globalSmoothing=ON)
+            ## Section
+            p.SectionAssignment(region=Region(faces=p.faces), sectionName='Section1')
+            ## Instance
+            ins = a.Instance(name='panel_'+str(panel), part=p, dependent=OFF)
+            ## Mesh
+            elem_type = mesh.ElemType(elemCode=S4R)
+            a.setElementType(regions=(ins.faces,), elemTypes=(elem_type,))
+            a.seedEdgeBySize(edges=ins.edges, constraint=FIXED, size=meshSize)
+            a.setMeshControls(regions=ins.faces, elemShape=TRI, allowMapped=ON, technique=FREE)
+            a.generateMesh(regions=(ins,))
+        
+        ## Step
+        m.StaticStep(name='Step-1', previous='Initial', nlgeom = OFF,initialInc=0.01)
+        m.FieldOutputRequest(name='F-Output-3', createStepName='Step-1', variables=('E','ENER','ELEN','ELEDEN' ))
+        
+        # Create a node list
+        nodeList = [] # n is the variable for all nodes in the unit cell
+        nodeLabels = [] # Node labels of all nodes
+        nseq = []
+        for ins in a.instances.keys():
+            for i in a.instances[ins].nodes:
+                nodeList.append(i)
+                nodeLabels.append((i.label,ins))
+                
+            nseq.append(a.instances[ins].nodes)
+            
+        N = len(nodeList) # Total number of nodes
+        # Find the outer dimensions of the unit cell
+        MinX = nodeList[0].coordinates[0]; MaxX = nodeList[0].coordinates[0];
+        MinY = nodeList[0].coordinates[1]; MaxY = nodeList[0].coordinates[1];
+        MinZ = nodeList[0].coordinates[2]; MaxZ = nodeList[0].coordinates[2];
+        for i in range(0,N):
+        
+            c = nodeList[i].coordinates
+        
+            if c[0] < MinX:
+                MinX = c[0]
+            if c[0] > MaxX:
+                MaxX = c[0]
+        
+            if c[1] < MinY:
+                MinY = c[1]
+            if c[1] > MaxY:
+                MaxY = c[1]
+        
+            if c[2] < MinZ:
+                MinZ = c[2]
+            if c[2] > MaxZ:
+                MaxZ = c[2]
+
+        # Reference points
+        rp1 = a.ReferencePoint(point=(x_divs*2*S+1, 0.0, 0.0))
+        rp2 = a.ReferencePoint(point=(x_divs*2*S+10, 0.0, 0.0))
+        rp3 = a.ReferencePoint(point=(S*x_divs, L*x_divs, H/2.0))
+        # Sets
+        def findVertex(vertCoord):
+            for ins in a.instances.keys():
+                vert = a.instances[ins].vertices.getByBoundingBox(vertCoord[0]-10*tol,vertCoord[1]-V/2.0-10*tol,vertCoord[2]-H,
+                                                                  vertCoord[0]+10*tol,vertCoord[1]+V/2.0+10*tol,vertCoord[2]+H)
+                if vert:
+                    objList = vert
+                    break
+            return(objList)
+        a.Set(name='rp1', referencePoints=(a.referencePoints[rp1.id], ))
+        a.Set(name='rp2', referencePoints=(
+            a.referencePoints[rp2.id], ))
+        objList = []
+        for ins in a.instances.keys():
+            objList.append(a.instances[ins].edges.getByBoundingBox(-1,-1,-1,0,y_divs*2*L,H))
+        a.Set(edges=tuple(objList), name="lb")
+        objList = []
+        for ins in a.instances.keys():
+            objList.append(a.instances[ins].edges.getByBoundingBox(x_divs*2*S,0,0,x_divs*2*S+1,y_divs*2*L,H))
+        a.Set(edges=tuple(objList), name="rb")
+        objList = []
+        for ins in a.instances.keys():
+            objList.append(a.instances[ins].edges.getByBoundingBox(-1,-1,H,x_divs*2*S,y_divs*2*L,H+1))
+        a.Set(edges=tuple(objList), name="front")
+        objList = []
+        for ins in a.instances.keys():
+            objList.append(a.instances[ins].edges.getByBoundingBox(-1,-1,-1,x_divs*2*S,(y_divs+1)*2*L,0))
+        a.Set(edges=tuple(objList), name="back")
+        objList = []
+        for ins in a.instances.keys():
+            objList.append(a.instances[ins].vertices.getByBoundingBox(-1,y_divs*2*L+V/2.0,-1,x_divs*2*S,y_divs*2*L+V*1.5,H))
+        a.Set(vertices=tuple(objList), name="top")
+        objList = []
+        for ins in a.instances.keys():
+            objList.append(a.instances[ins].vertices.getByBoundingBox(-1,-1,-1,x_divs*2*S,V/2.0,H))
+        a.Set(vertices=tuple(objList), name="bottom")
+        objList = []
+        for ins in a.instances.keys():
+            objList.append(a.instances[ins].vertices.getByBoundingBox(-1,-1,-1,1,1,1))
+        a.Set(vertices=tuple(objList), name="bottomLeft")
+        vertCoord = np.array([0,V/2.0,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name='bottomBack')
+        vertCoord = np.array([0,y_divs*L*2+V/2.0,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name='topBack')
+        vertCoord = np.array([0,y_divs*L,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name='centerBack')
+        objList = []
+        vertCoord = np.array([x_divs*S*2,y_divs*L*2+V/2.0,H])
+        objList.append(findVertex(vertCoord))
+        vertCoord = np.array([0,V/2.0,H])
+        objList.append(findVertex(vertCoord))
+        a.Set(vertices=objList, name='bottomBackTopFront')
+        objList = []
+        vertCoord = np.array([0,y_divs*L*2+V/2.0,H])
+        objList.append(findVertex(vertCoord))
+        vertCoord = np.array([x_divs*S*2,V/2.0,H])
+        objList.append(findVertex(vertCoord))
+        a.Set(vertices=objList, name='topBackBottomFront')
+        vertCoord = np.array([x_divs*S,y_divs*L+V/2.0,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name="c")
+        vertCoord = np.array([(x_divs+2)*S,y_divs*L+V/2.0,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name="cx+")
+        vertCoord = np.array([(x_divs-2)*S,y_divs*L+V/2.0,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name="cx-")
+        vertCoord = np.array([x_divs*S,(y_divs+2)*L+V/2.0,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name="cy+")
+        vertCoord = np.array([x_divs*S,(y_divs-2)*L+V/2.0,H])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name="cy-")
+        vertCoord = np.array([(x_divs-1)*S,(y_divs-1)*L+V/2.0,0])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name="cbl")
+        vertCoord = np.array([(x_divs+1)*S,(y_divs-1)*L+V/2.0,0])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name="cbr")
+        vertCoord = np.array([(x_divs-1)*S,(y_divs+1)*L+V/2.0,0])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name="ctl")
+        vertCoord = np.array([(x_divs+1)*S,(y_divs+1)*L+V/2.0,0])
+        objList = findVertex(vertCoord)
+        a.Set(vertices=objList, name="ctr")
+        # Surface
+        objList = []
+        for ins in a.instances.keys():
+            objList.append(a.instances[ins].edges.getByBoundingBox(x_divs*2*S,0,0,x_divs*2*S+1,y_divs*2*L,H))
+        a.Surface(name='rb', side1Edges=tuple(objList))
+        # Assign boundary conditions and loads
+        if prop == 'Ex':
+            # Equations
+            m.Equation(name='rb', terms=((1.0, 'rb', 1), (-1.0, 'rp2', 
+                1)))
+            # BCs
+            m.DisplacementBC(amplitude=UNSET, createStepName='Initial'
+                , distributionType=UNIFORM, fieldName='', localCsys=None, name='lb', 
+                region=a.sets['lb'], u1=SET, u2=UNSET, 
+                u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'rb', region=a.sets['rp2'], u1=xDisp, u2=
+                UNSET, u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Initial'
+                , distributionType=UNIFORM, fieldName='', localCsys=None, name='bottomLeft', 
+                region=a.sets['bottomLeft'], u1=UNSET, u2=SET
+                , u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'back', region=a.sets['back'], u1=UNSET, 
+                u2=UNSET, u3=0.0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            # Output requests
+            m.HistoryOutputRequest(createStepName='Step-1', name=
+                'H-Output-3', rebar=EXCLUDE, region=
+                a.sets['rp2'], sectionPoints=DEFAULT, 
+                variables=('U1', 'U2', 'RF1', 'RF2'))
+            for vertex in ['c','cx+','cx-','cy+','cy-','cbl','cbr','ctl','ctr']:
+                m.FieldOutputRequest(name=vertex, 
+                    createStepName='Step-1', variables=('U', ), frequency=LAST_INCREMENT, 
+                    region=a.sets[vertex], sectionPoints=DEFAULT, position=NODES, rebar=EXCLUDE)
+        
+        if prop == 'Ey':
+            # Equations
+            mdb.models['thetaKcr'].Equation(name='topb', terms=((1.0, 'top', 2), (-1.0, 'rp2', 
+                2)))
+            # BCs
+            m.DisplacementBC(amplitude=UNSET, createStepName='Initial'
+                , distributionType=UNIFORM, fieldName='', localCsys=None, name='lb', 
+                region=a.sets['bottom'], u1=UNSET, u2=SET, 
+                u3=SET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'rb', region=a.sets['rp2'], u1=UNSET, u2=
+                xDisp, u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Initial'
+                , distributionType=UNIFORM, fieldName='', localCsys=None, name='bottomLeft', 
+                region=a.sets['bottomLeft'], u1=UNSET, u2=SET
+                , u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'back', region=a.sets['back'], u1=UNSET, 
+                u2=UNSET, u3=0.0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            # Output requests
+            m.HistoryOutputRequest(createStepName='Step-1', name=
+                'H-Output-3', rebar=EXCLUDE, region=
+                a.sets['rp2'], sectionPoints=DEFAULT, 
+                variables=('U1', 'U2', 'RF1', 'RF2'))
+            for vertex in ['c','cx+','cx-','cy+','cy-','cbl','cbr','ctl','ctr']:
+                m.FieldOutputRequest(name=vertex, 
+                    createStepName='Step-1', variables=('U', ), frequency=LAST_INCREMENT, 
+                    region=a.sets[vertex], sectionPoints=DEFAULT, position=NODES, rebar=EXCLUDE)
+        
+        if prop == 'Gxy':
+            # Equations
+            m.Equation(name='rbx', terms=((1.0, 'rb', 1), (-1.0, 'rp2', 
+                1)))
+            m.Equation(name='rby', terms=((1.0, 'rb', 2), (-1.0, 'rp2', 
+                2)))
+            m.Equation(name='frontz', terms=((1.0, 'front', 3), (-1.0, 'rp1', 
+                3)))
+            # BCs
+            m.DisplacementBC(amplitude=UNSET, createStepName='Initial'
+                , distributionType=UNIFORM, fieldName='', localCsys=None, name='lb', 
+                region=a.sets['lb'], u1=SET, u2=SET, 
+                u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'rb', region=a.sets['rp2'], u1=UNSET, u2=
+                xDisp, u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'back', region=a.sets['back'], u1=UNSET, 
+                u2=UNSET, u3=0.0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            # Output requests
+            m.HistoryOutputRequest(createStepName='Step-1', name=
+                'H-Output-3', rebar=EXCLUDE, region=
+                a.sets['rp2'], sectionPoints=DEFAULT, 
+                variables=('U1', 'U2', 'RF1', 'RF2'))
+            for vertex in ['c','cx+','cx-','cy+','cy-','cbl','cbr','ctl','ctr']:
+                m.FieldOutputRequest(name=vertex, 
+                    createStepName='Step-1', variables=('U', ), frequency=LAST_INCREMENT, 
+                    region=a.sets[vertex], sectionPoints=DEFAULT, position=NODES, rebar=EXCLUDE)
+        
+        if prop == 'Mx':
+            # Expression field
+            mdb.models['thetaKcr'].ExpressionField(description='', expression=
+                '(Z-'+str(H/2.0)+')/'+str(H), localCsys=None, name='momentY')
+            # Load
+            mdb.models['thetaKcr'].ShellEdgeLoad(createStepName='Step-1', directionVector=(
+                (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)), distributionType=FIELD, field='momentY', 
+                follower=OFF, localCsys=None, magnitude=0.001, name='momentY', region=
+                mdb.models['thetaKcr'].rootAssembly.surfaces['rb'], resultant=ON, traction=
+                GENERAL)
+            # Boundary conditions, sets, constraints
+            mdb.models['thetaKcr'].DisplacementBC(amplitude=UNSET, createStepName='Initial'
+                , distributionType=UNIFORM, fieldName='', localCsys=None, name='lb', 
+                region=mdb.models['thetaKcr'].rootAssembly.sets['lb'], u1=SET, u2=UNSET, 
+                u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            mdb.models['thetaKcr'].DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'bottomLeft', region=mdb.models['thetaKcr'].rootAssembly.sets['bottomLeft'], u1=0, u2=
+                0, u3=0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            mdb.models['thetaKcr'].DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'topBack', region=mdb.models['thetaKcr'].rootAssembly.sets['topBack'], u1=UNSET, u2=
+                UNSET, u3=0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            # Output request
+            mdb.models['thetaKcr'].IntegratedOutputSection(name='rb', refPoint=Region(
+                referencePoints=(
+                mdb.models['thetaKcr'].rootAssembly.referencePoints[rp3.id], )), 
+                refPointAtCenter=ON, refPointMotion=INDEPENDENT, surface=
+                mdb.models['thetaKcr'].rootAssembly.surfaces['rb'])
+            mdb.models['thetaKcr'].HistoryOutputRequest(createStepName='Step-1', 
+                integratedOutputSection='rb', name='H-Output-4', rebar=EXCLUDE, 
+                sectionPoints=DEFAULT, variables=('SOF', 'SOM'))
+        
+        if prop == 'My':
+            # Load
+            moment = 0.05
+            MyNodesTop = []
+            MyNodesBottom = []
+            ycoord = ((y_divs-1)*2*L+0.5*L)+V/2.0
+            for i in range(0,N):
+                c = nodeList[i].coordinates
+                if abs(c[1] - ycoord) < meshSize/2.0 and abs(c[0] - round(c[0] / S) * S) < tol:
+                    if c[2] - (MaxZ+MinZ)/2.0 > 0:
+                        MyNodesTop.append(nodeList[i])
+                        zbar = c[2] - (MaxZ+MinZ)/2.0
+                    if c[2] - (MaxZ+MinZ)/2.0 < 0:
+                        MyNodesBottom.append(nodeList[i])
+            for n in MyNodesTop:
+                F = -moment/2/zbar/len(MyNodesTop)
+                Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+                if abs(F) > 1e-7:
+                    m.ConcentratedForce(name=str(n.instanceName)+'N'+str(n.label), 
+                        createStepName='Step-1', region=Ri, cf2=F, localCsys=None)
+            for n in MyNodesBottom:
+                F = moment/2/zbar/len(MyNodesBottom)
+                Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+                if abs(F) > 1e-7:
+                    m.ConcentratedForce(name=str(n.instanceName)+'N'+str(n.label), 
+                        createStepName='Step-1', region=Ri, cf2=F, localCsys=None)
+            # BCs
+            MyBC = []
+            MyBottomLeft = []
+            MyBottomRight = []
+            ycoord = (0.5*L)+V/2.0
+            for i in range(0,N):
+                c = nodeList[i].coordinates
+                if abs(c[1] - ycoord) < meshSize/5:
+                    MyBC.append(nodeList[i])
+                    if abs(c[0] - MinX) < meshSize*3:
+                        MyBottomLeft.append(nodeList[i])
+                    if abs(c[0] - MaxX) < meshSize*3:
+                        MyBottomRight.append(nodeList[i])
+            for n in MyBC:
+                Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+                m.DisplacementBC(name='MyBC'+n.instanceName+str(n.label), createStepName='Step-1', 
+                    region=Ri, u1=UNSET, u2=0.0, u3=UNSET, ur1=UNSET, ur2=UNSET, ur3=UNSET, 
+                    amplitude=UNSET, fixed=OFF, distributionType=UNIFORM, fieldName='', 
+                    localCsys=None)
+            n = MyBottomLeft[0]
+            Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+            m.DisplacementBC(name='MyBottomLeft', createStepName='Step-1', 
+                region=Ri, u1=0.0, u2=0.0, u3=0.0, ur1=UNSET, ur2=UNSET, ur3=UNSET, 
+                amplitude=UNSET, fixed=OFF, distributionType=UNIFORM, fieldName='', 
+                localCsys=None)
+            n = MyBottomRight[0]
+            Ri = regionToolset.Region(nodes=a.instances[n.instanceName].nodes.sequenceFromLabels(labels=(n.label,)))
+            m.DisplacementBC(name='MyBottomRight', createStepName='Step-1', 
+                region=Ri, u1=UNSET, u2=UNSET, u3=0.0, ur1=UNSET, ur2=UNSET, ur3=UNSET, 
+                amplitude=UNSET, fixed=OFF, distributionType=UNIFORM, fieldName='', 
+                localCsys=None)
+        
+        if prop == 'Txy':
+            # Load
+            TxyNodesTop = []
+            TxyNodesBottom = []
+            ycoord = ((y_divs-1)*2*L+0.5*L)+V/2.0
+            for i in range(0,N):
+                c = nodeList[i].coordinates
+                if abs(c[1] - ycoord) < meshSize/2.0 and abs(c[0] - round(c[0] / S) * S) < tol:
+                    if c[2] - (MaxZ+MinZ)/2.0 > 0:
+                        TxyNodesTop.append(nodeList[i])
+                        zbar = c[2] - (MaxZ+MinZ)/2.0
+                    if c[2] - (MaxZ+MinZ)/2.0 < 0:
+                        TxyNodesBottom.append(nodeList[i])
+            # BCs
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'bottomBackTopFront', region=a.sets['bottomBackTopFront'], u1=UNSET, u2=
+                UNSET, u3=1, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'topBackBottomFront', region=a.sets['topBackBottomFront'], u1=UNSET, u2=
+                UNSET, u3=0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            m.DisplacementBC(amplitude=UNSET, createStepName='Step-1', 
+                distributionType=UNIFORM, fieldName='', fixed=OFF, localCsys=None, name=
+                'topBack', region=a.sets['topBack'], u1=0, u2=
+                0, u3=0, ur1=UNSET, ur2=UNSET, ur3=UNSET)
+            MyBC = []
+            MyBottomLeft = []
+            MyBottomRight = []
+            ycoord = (0.5*L)+V/2.0
+            for i in range(0,N):
+                c = nodeList[i].coordinates
+                if abs(c[1] - ycoord) < meshSize/5:
+                    MyBC.append(nodeList[i])
+                    if abs(c[0] - MinX) < meshSize:
+                        MyBottomLeft.append(nodeList[i])
+                    if abs(c[0] - MaxX) < meshSize:
+                        MyBottomRight.append(nodeList[i])
+            # Output request
+            m.IntegratedOutputSection(name='rb', refPoint=Region(
+                referencePoints=(
+                a.referencePoints[rp3.id], )), 
+                refPointAtCenter=ON, refPointMotion=INDEPENDENT, surface=
+                a.surfaces['rb'])
+            m.HistoryOutputRequest(createStepName='Step-1', 
+                integratedOutputSection='rb', name='H-Output-4', rebar=EXCLUDE, 
+                sectionPoints=DEFAULT, variables=('SOF', 'SOM'))
+            for vertex in ['c','cx+','cx-','cy+','cy-','cbl','cbr','ctl','ctr']:
+                m.FieldOutputRequest(name=vertex, 
+                    createStepName='Step-1', variables=('U', ), frequency=LAST_INCREMENT, 
+                    region=a.sets[vertex], sectionPoints=DEFAULT, position=NODES, rebar=EXCLUDE)
+            m.FieldOutputRequest(name='bottomBack', 
+                createStepName='Step-1', variables=('RF', ), frequency=LAST_INCREMENT, 
+                region=a.sets['bottomBack'], sectionPoints=DEFAULT, position=NODES, rebar=EXCLUDE)
+        
+        ## Interaction: crease property assignment
+        # Locate midpoints of the creases
+        creasesRep = []
+        for panel in connect.keys():
+            for i in range(len(connect[panel]) - 1):
+                creasesRep.append([connect[panel][i], connect[panel][i+1]])
+        creasesRep = np.sort(np.array(creasesRep), axis=1)
+        unique_elements, counts = np.unique(creasesRep,axis=0, return_counts=True)
+        indices = np.where(counts > 1)[0]
+        creases = unique_elements[indices]
+        midpoints = []
+        sprList = []
+        crConn = {} #dictionary of creases with their connecting panels
+        for c in creases:
+              midpoints.append([0.5*(x[c[0]]+x[c[1]]),0.5*(y[c[0]]+y[c[1]]),0.5*(z[c[0]]+z[c[1]]),c])
+              crConn[tuple(c)]=[]
+        for mp in midpoints:
+              for panel in connect.keys():
+                  e = a.instances['panel_'+str(panel)].edges.findAt((mp[0:3],),)
+                  if len(e) > 0:
+                      a.Set(edges=e, name=str(mp[3])+'panel_'+str(panel)) # Create a set for the crease passing mp
+                      crConn[tuple(mp[3])].append(panel)
+        for c in crConn.keys():
+            crConn[c].sort() #sort the list of panels in ascending order
+        #Find all nodes on the boundaries
+        FrontN = []
+        BackN = []
+        TopN = []
+        BottomN = []
+        connList = []
+        ## Assign connectors
+        vertices = {}
+        vertNum = np.setdiff1d(Node_idx.flatten(), BDRY)
+        for vertex in vertNum:
+            vertices[vertex] = []
+        for vertex in vertices: 
+            for panel in connect.keys():
+                if vertex in connect[panel]:
+                    vertices[vertex].append(panel)
+            vertices[vertex].sort()# a list of panels connected to the vertex
+        # Distance calculator
+        def Distance(P,Q):
+        
+            Px = P[0]
+            Qx = Q[0]
+            
+            Py = P[1]
+            Qy = Q[1]
+        
+            Pz = P[2]
+            Qz = Q[2]
+        
+            dist = math.sqrt((Px-Qx)**2 + (Py-Qy)**2 + (Pz-Qz)**2)
+        
+            return(dist)
+        # Corresponding node detection: returns indices of nodes2 that match the original order of nodes1
+        def corresponding_detector(nodes1,nodes2):
+            length_nodes1 = len(nodes1)
+            length_nodes2 = len(nodes2)
+            record = [0] * length_nodes1
+            D = np.zeros(length_nodes1)
+        
+            for i in range(0,length_nodes1):
+        
+                coordinates_nodes1 = nodes1[i][0:3]
+        
+                for j in range(0,length_nodes2):
+        
+                    coordinates_nodes2 = nodes2[j][0:3]
+        
+                    D[j] = Distance(coordinates_nodes1,coordinates_nodes2)
+        
+                record[i] = D.argmin() # Index of the matching node in nodes2
+                
+            return(record)
+        # A function to assign torsional springs between corresponding nodes on coincident edges
+        def springs(setName,xyplane):
+            setName = str(np.array(setName))
+            panelA = 'panel_'+str(crConn[c][0])
+            panelB = 'panel_'+str(crConn[c][1])
+            # Nodes on edges a and b
+            nodes_a = a.sets[setName+panelA].nodes
+            nodes_b = a.sets[setName+panelB].nodes
+            node_num = len(nodes_a)
+            
+            # Coordinates of the nodes
+            coord_a = np.zeros((node_num,4))
+            coord_b = np.zeros((node_num,4))
+            
+            # Record node coordinates and label. Nodes with the same label are not necessarily coincident.
+            for ni in range (0,node_num):
+                coord_a[ni][0:3] = nodes_a[ni].coordinates[0:3]
+                coord_a[ni][3] = ni     
+                coord_b[ni][0:3] = nodes_b[ni].coordinates[0:3]
+                coord_b[ni][3] = ni
+            record = corresponding_detector(coord_a,coord_b)
+            coord_b = [coord_b[i] for i in record]
+            # Create a local coordinate system (x axis along hinge)
+            ori = coord_a[0][0:3]
+            xaxis = coord_a[-1][0:3]
+            csy_loc = a.DatumCsysByThreePoints(origin=ori, point1=xaxis, point2=xyplane, name='csy_local'+setName+str(UjStiffness).replace(".","_"), 
+                                                coordSysType=CARTESIAN)
+            # Create a torsional spring for each pair of nodes
+            for ni in range (node_num):
+                # Check if a connector is needed
+                assign = 1
+                # Avoid conflict with PBC
+                for n in c:
+                    if n in BackN or n in BottomN:
+                        bdist = Distance([x[n],y[n],z[n]],coord_a[ni][0:3]) 
+                        if bdist < 0.01:
+                            assign = 0
+                #Avoid conflict at the vertices
+                for vertex in vertices:
+                    if vertex in c:
+                        vdist = Distance([x[vertex],y[vertex],z[vertex]],coord_a[ni][0:3])
+                        if vdist < 0.01:
+                            if vertices[vertex][0] in crConn[c] and vertices[vertex][-1] in crConn[c]:
+                                #skip the 4th connector assignment to avoid conflict
+                                assign = 0
+                if assign == 0: # No need for a connector
+                    continue
+                if assign == 1: # assign a connector to the node pair
+                    springName = setName + str(ni) + panelA + panelB
+                    id_a   = int(coord_a[ni][3]) # Node on edge a
+                    id_b   = int(coord_b[ni][3]) # Corresponding node on edge b
+                    sprList.append([nodes_a[id_a].instanceName+'N'+str(nodes_a[id_a].label), nodes_b[id_b].instanceName+'N'+str(nodes_b[id_b].label)])
+                rgn1pair0=regionToolset.Region(nodes=nodes_a[id_a:(id_a+1)])
+                rgn2pair0=regionToolset.Region(nodes=nodes_b[id_b:(id_b+1)])
+                region=((rgn1pair0, rgn2pair0), )
+                datum = a.datums[csy_loc.id]
+                a.engineeringFeatures.TwoPointSpringDashpot(
+                    name=springName, regionPairs=region, axis=FIXED_DOF, dof1=4, 
+                    dof2=4, orientation=datum, springBehavior=ON, 
+                    springStiffness=UjStiffness, dashpotBehavior=OFF, 
+                    dashpotCoefficient=0.0)
+        # Locate a point not coincident to any hinges
+        randpt = [0.,0.,-20.]
+        UjStiffness = jStiffness
+        ##
+        # Find characteristic displacement fields
+        ##
+        def writeInp(text, inpList, lineNum):
+            inpList.insert(lineNum, text+'\n')
+            lineNum = lineNum + 1
+            return(lineNum)
+        def connCoord(setName,xyplane):
+            setName = str(np.array(setName))
+            for panelANum in range(len(crConn[c])-1):
+                panelAstr = 'panel_'+str(crConn[c][panelANum])
+                # Nodes on edges a and b
+                nodes_a = a.sets[setName+panelAstr].nodes
+                node_num = len(nodes_a)
+                
+                # Coordinates of the nodes
+                coord_a = np.zeros((node_num,4))
+                
+                # Record node coordinates and label. Nodes with the same label are not necessarily coincident.
+                for ni in range(0,node_num):
+                    coord_a[ni][0:3] = nodes_a[ni].coordinates[0:3]
+                    coord_a[ni][3] = ni     
+                # Create a local coordinate system (x axis along hinge)
+                ori = np.array(coord_a[0][0:3])
+                xaxis = np.array(coord_a[-1][0:3])
+                global endAss
+                endAss = writeInp('*Orientation, name="csy_local'+setName+str(UjStiffness).replace(".","_")+'"',lines_comm,endAss)
+                csysA = (xaxis-ori)/np.linalg.norm(xaxis-ori)
+                csysB = (xyplane-ori)/np.linalg.norm(xyplane-ori)
+                endAss = writeInp(str(csysA[0])+', '+str(csysA[1])+', '+str(csysA[2])+', '+str(csysB[0])+', '+str(csysB[1])+', '+str(csysB[2]),lines_comm,endAss)
+                endAss = writeInp('1, 0.',lines_comm,endAss)
+        # A function to assign connectors
+        def user_joint(setName,joint_name,xyplane):#setName is the end nodes of the crease
+            setName = str(np.array(setName))
+            for panelANum in range(len(crConn[c])-1):
+                panelAstr = 'panel_'+str(crConn[c][panelANum])
+                panelA = crConn[c][panelANum]
+                panelBstr = 'panel_'+str(crConn[c][panelANum+1])
+                panelB = crConn[c][panelANum+1]
+                # Nodes on edges a and b
+                nodes_a = a.sets[setName+panelAstr].nodes
+                nodes_b = a.sets[setName+panelBstr].nodes
+                node_num = len(nodes_a)
+                
+                # Coordinates of the nodes
+                coord_a = np.zeros((node_num,4))
+                coord_b = np.zeros((node_num,4))
+                
+                # Record node coordinates and label. Nodes with the same label are not necessarily coincident.
+                for ni in range(0,node_num):
+                    coord_a[ni][0:3] = nodes_a[ni].coordinates[0:3]
+                    coord_a[ni][3] = ni     
+                    coord_b[ni][0:3] = nodes_b[ni].coordinates[0:3]
+                    coord_b[ni][3] = ni
+                # Sort the nodes in b according to their distances from a
+                record = corresponding_detector(coord_a,coord_b)
+                coord_b = [coord_b[i] for i in record]
+                # Create a connector for each pair of nodes
+                for ni in range(node_num):
+                    # Check if a connector is needed
+                    assign = 1
+                    # Avoid conflict with PBC
+                    for n in c:
+                        for boundary in groupedBoundaries:
+                            if n in Boundaries[boundary]['vertices']:
+                                bdist = Distance([x[n],y[n],z[n]],coord_a[ni][0:3]) 
+                                if bdist < 0.01:
+                                    assign = 0
+                    #Avoid conflict at the vertices
+                    for vertex in vertices:
+                        if vertex in c:
+                            vdist = Distance([x[vertex],y[vertex],z[vertex]],coord_a[ni][0:3])
+                            
+                            if vdist < 0.01:
+                                # print(vertex,vdist,vertices[vertex][0],vertices[vertex][-1],[panelA,panelB])
+                                if vertices[vertex][0] in set([panelA,panelB]) and vertices[vertex][1] in set([panelA,panelB]):
+                                    #skip the 4th connector assignment to avoid conflict
+                                    assign = 0
+                                    # print(vertex)
+                    if assign == 0: # No need for a connector
+                        continue
+                    if assign == 1: # assign a connector to the node pair
+                        id_a   = int(coord_a[ni][3]) # Node on edge a
+                        id_b   = int(coord_b[ni][3]) # Corresponding node on edge b
+                    # Create a set for the wire (actually its corresponing edge in the root assembly)
+                    temp_name = setName+'-'+str(ni)+ panelAstr + panelBstr
+                    global endAss
+                    global eleNum
+                    eleNum +=1
+                    lines_comm.insert(endAss,'*Element, type=CONN3D2\n')
+                    endAss +=1
+                    lines_comm.insert(endAss,str(eleNum)+', '+nodes_a[id_a].instanceName+'.'+str(nodes_a[id_a].label)+', '+nodes_b[id_b].instanceName+'.'+str(nodes_b[id_b].label)+'\n')
+                    endAss +=1
+                    lines_comm.insert(endAss,'*Connector Section, elset="'+temp_name+'", behavior='+joint_name+'\n')
+                    endAss +=1
+                    lines_comm.insert(endAss,'Join, Revolute'+'\n')
+                    endAss +=1
+                    lines_comm.insert(endAss,'"'+'csy_local'+setName+str(jStiffness).replace(".","_")+'",'+ '\n')
+                    endAss +=1
+        def createWire(setName):
+            setName = str(np.array(setName))
+            for panelANum in range(len(crConn[c])-1):
+                panelAstr = 'panel_'+str(crConn[c][panelANum])
+                panelA = crConn[c][panelANum]
+                panelBstr = 'panel_'+str(crConn[c][panelANum+1])
+                panelB = crConn[c][panelANum+1]
+                # Nodes on edges a and b
+                nodes_a = a.sets[setName+panelAstr].nodes
+                nodes_b = a.sets[setName+panelBstr].nodes
+                node_num = len(nodes_a)
+                
+                # Coordinates of the nodes
+                coord_a = np.zeros((node_num,4))
+                coord_b = np.zeros((node_num,4))
+                
+                # Record node coordinates and label. Nodes with the same label are not necessarily coincident.
+                for ni in range(0,node_num):
+                    coord_a[ni][0:3] = nodes_a[ni].coordinates[0:3]
+                    coord_a[ni][3] = ni     
+                    coord_b[ni][0:3] = nodes_b[ni].coordinates[0:3]
+                    coord_b[ni][3] = ni
+                # Sort the nodes in b according to their distances from a
+                record = corresponding_detector(coord_a,coord_b)
+                coord_b = [coord_b[i] for i in record]
+                # Create a connector for each pair of nodes
+                for ni in range(node_num):
+                    # Check if a connector is needed
+                    assign = 1
+                    # Avoid conflict with PBC
+                    for n in c:
+                        for boundary in groupedBoundaries:
+                            if n in Boundaries[boundary]['vertices']:
+                                bdist = Distance([x[n],y[n],z[n]],coord_a[ni][0:3]) 
+                                if bdist < 0.01:
+                                    assign = 0
+                    #Avoid conflict at the vertices
+                    for vertex in vertices:
+                        if vertex in c:
+                            vdist = Distance([x[vertex],y[vertex],z[vertex]],coord_a[ni][0:3])
+                            
+                            if vdist < 0.01:
+                                # print(vertex,vdist,vertices[vertex][0],vertices[vertex][-1],[panelA,panelB])
+                                if vertices[vertex][0] in set([panelA,panelB]) and vertices[vertex][1] in set([panelA,panelB]):
+                                    #skip the 4th connector assignment to avoid conflict
+                                    assign = 0
+                                    print(vertex)
+                    if assign == 0: # No need for a connector
+                        continue
+                    if assign == 1: # assign a connector to the node pair
+                        id_a   = int(coord_a[ni][3]) # Node on edge a
+                        id_b   = int(coord_b[ni][3]) # Corresponding node on edge b
+
+                    # Create a set for the wire (actually its corresponing edge in the root assembly)
+                    temp_name = setName+'-'+str(ni)+ panelAstr + panelBstr
+                    global endAss
+                    global eleNum
+                    eleNum +=1
+                    endAss = writeInp('*Nset, nset="'+temp_name+'", instance='+panelAstr,lines_comm,endAss)
+                    endAss = writeInp(' '+str(nodes_a[id_a].label)+',',lines_comm,endAss)
+                    endAss = writeInp('*Nset, nset="'+temp_name+'", instance='+panelBstr,lines_comm,endAss)
+                    endAss = writeInp(' '+str(nodes_b[id_b].label)+',',lines_comm,endAss)
+                    endAss = writeInp('*Elset, elset="'+temp_name+'"',lines_comm,endAss)
+                    endAss = writeInp(' '+str(eleNum)+',',lines_comm,endAss)
+            
+        connList = []
+        connSet = []
+        # Put boundary mesh nodes into groups
+        Boundaries = {'Back':{'nodes':[],'midpoints':[],'vertices':BackN,
+                              'oppBoundary':'Front','latticeVector':np.array([2*S,0,0])},
+                      'Bottom':{'nodes':[],'midpoints':[],'vertices':BottomN,
+                                'oppBoundary':'Top','latticeVector':np.array([0,2*L,0])}}
+        groupedBoundaries = Boundaries.keys()
+        
+        # Input file
+        InputFileName = JobName + '.inp'
+        mdb.Job(name=JobName, model=modelName, description='', type=ANALYSIS, 
+                atTime=None, waitMinutes=0, waitHours=0, queue=None, memory=90, 
+                memoryUnits=PERCENTAGE, getMemoryFromAnalysis=True, 
+                explicitPrecision=SINGLE, nodalOutputPrecision=SINGLE, echoPrint=OFF, 
+                modelPrint=OFF, contactPrint=OFF, historyPrint=OFF, userSubroutine='', 
+                scratch='', resultsFormat=ODB, parallelizationMethodExplicit=DOMAIN, 
+                numDomains=1, activateLoadBalancing=False, multiprocessingMode=DEFAULT, 
+                numCpus=1, numGPUs=0)
+        mdb.jobs[JobName].writeInput(consistencyChecking=OFF)
+        ###-----Wait and Read the Input File
+        while not os.path.exists(InputFileName):
+            time.sleep(10)
+        if os.path.isfile(InputFileName):
+            copyfile(InputFileName, JobName+'Conn.inp')
+        else:
+            raise ValueError("Input file is not generated yet!")
+        k = open(InputFileName)
+        lines_comm = k.readlines()
+        for i in range(len(lines_comm) - 1, -1, -1):  # Iterate from the end
+            if lines_comm[i] == '*End Instance\n':
+                endAss = i + 2
+                break
+        k.close()
+        
+        # Connectors
+        eleNum = 0
+        for c in crConn.keys():
+            user_joint(c,'RJY',randpt) 
+        
+        # Wires
+        eleNum = 0
+        for c in crConn.keys():
+            createWire(c)
+
+        for i in range(len(lines_comm) - 1, -1, -1):  # Iterate from the end
+            if lines_comm[i] == '*End Assembly\n':
+                endAss = i
+                break
+        # Connector coordinates
+        for c in crConn.keys():
+            connCoord(c,randpt) 
+        # Define connector properties
+        endAss += 1
+        endAss = writeInp('*Connector Behavior, name=RJY',lines_comm,endAss)
+        endAss = writeInp('*Connector Elasticity, component=4',lines_comm,endAss)
+        endAss = writeInp(' '+str(jStiffness)+',',lines_comm,endAss)
+        # Write inp file
+        JobName = prop+str(x_divs)+'by'+str(y_divs)+'t'+str(angle).replace(".","_")+'Kcr'+str(Kcr).replace(".","_")
+        inptxt = open(JobName+'.inp', 'w+')
+        for j in lines_comm:
+            inptxt.write(j)
+        inptxt.close()
+        # Submit job
+        mdb.JobFromInputFile(name=JobName, inputFileName=JobName+'.inp', type=ANALYSIS, atTime=None,
+            waitMinutes=0, waitHours=0, queue=None, memory=90, memoryUnits=PERCENTAGE,
+            getMemoryFromAnalysis=True, explicitPrecision=SINGLE, nodalOutputPrecision=SINGLE, 
+            userSubroutine='', scratch='', resultsFormat=ODB, multiprocessingMode=DEFAULT,
+            numCpus=4, numDomains=4, numGPUs=0)
+        mdb.jobs[JobName].submit(consistencyChecking=OFF)
+        mdb.jobs[JobName].waitForCompletion()
+        
+## Postprocessing
+vxy = []
+Ex = []
+vyx = []
+Ey = []
+Gyx = []
+Mx = []
+vbxy = []
+My = []
+Txy = []
+properties = ['Ex','Ey','Gxy','Mx','My','Txy']#
+for angle in foldAngles:
+    for prop in properties:
+        if prop in ['Ex', 'Ey' , 'Mx', 'My','Txy']:
+            x_divs = 7
+            y_divs = 7
+        if prop == 'Gxy':
+            x_divs = 3
+            y_divs = 24
+        theta=np.pi*angle/180 #fold angle
+        gmma = 60*np.pi/180 #sector angle
+        zeta = np.arctan(np.cos(theta)*np.tan(gmma))
+        psi = np.arcsin(np.sin(theta)*np.sin(gmma))
+        a = 20
+        b = 20
+        H = a*np.sin(theta)*np.sin(gmma)
+        S = b*np.cos(theta)*np.tan(gmma)/np.sqrt(1+np.cos(theta)**2*np.tan(gmma)**2)
+        L = a*np.sqrt(1-np.sin(gmma)**2*np.sin(theta)**2)
+        V = b/np.sqrt(1+np.cos(theta)**2*np.tan(gmma)**2)
+        # In-plane
+        JobName = prop+str(x_divs)+'by'+str(y_divs)+'t'+str(angle).replace(".","_")+'Kcr'+str(Kcr).replace(".","_")
+        odb = session.openOdb(name=JobName+'.odb')
+        dispField = odb.steps['Step-1'].frames[-1].fieldOutputs['U']
+        topNode = odb.rootAssembly.nodeSets['CTL'].nodes[0][0]
+        topU2 = dispField.getSubset(region=topNode).values[0].data[1]
+        bottomNode = odb.rootAssembly.nodeSets['CBL'].nodes[0][0]
+        bottomU2 = dispField.getSubset(region=bottomNode).values[0].data[1]
+        a1 = odb.rootAssembly.nodeSets['CTL'].nodes[0][0]
+        defCoorda1 = a1.coordinates+dispField.getSubset(region=a1).values[0].data
+        a2 = odb.rootAssembly.nodeSets['CTR'].nodes[0][0]
+        defCoorda2 = a2.coordinates+dispField.getSubset(region=a2).values[0].data
+        a3 = odb.rootAssembly.nodeSets['CBL'].nodes[0][0]
+        defCoorda3 = a3.coordinates+dispField.getSubset(region=a3).values[0].data
+        a4 = odb.rootAssembly.nodeSets['CBR'].nodes[0][0]
+        defCoorda4 = a4.coordinates+dispField.getSubset(region=a4).values[0].data
+        epsx = (defCoorda2[0]-defCoorda1[0])/(2*S)-1
+        epsy = (topU2-bottomU2)/(2*L)
+        for key in odb.steps['Step-1'].historyRegions.keys():
+            if 'Node' in key:
+                RFx = odb.steps['Step-1'].historyRegions[key].historyOutputs['RF1'].data[-1][1]
+                RFy = odb.steps['Step-1'].historyRegions[key].historyOutputs['RF2'].data[-1][1]
+        if prop == 'Ex':
+            sigmax = RFx/(2*L*y_divs*H)
+            vxy.append(-epsy/epsx)
+            Ex.append(sigmax/epsx)
+        if prop == 'Ey':
+            sigmay = RFy/(2*S*x_divs*H)
+            vyx.append(-epsx/epsy)
+            Ey.append(sigmay/epsy)
+        if prop == 'Gxy':
+            sigma12 = RFy/(y_divs*2*L*H)
+            eps12 = xDisp/(2*x_divs*S)
+            Gyx.append(RFy*x_divs*S/(y_divs*L*H*xDisp))
+        if prop == 'Mx':
+            a1 = odb.rootAssembly.nodeSets['CX-'].nodes[0][0]
+            defCoorda1 = a1.coordinates+dispField.getSubset(region=a1).values[0].data
+            a2 = odb.rootAssembly.nodeSets['C'].nodes[0][0]
+            defCoorda2 = a2.coordinates+dispField.getSubset(region=a2).values[0].data
+            a3 = odb.rootAssembly.nodeSets['CX+'].nodes[0][0]
+            defCoorda3 = a3.coordinates+dispField.getSubset(region=a3).values[0].data
+            v1 = defCoorda2-defCoorda1
+            v2 = defCoorda3-defCoorda2
+            A = np.linalg.norm(np.cross(v1,v2))/2.0
+            kppax = 4*A/(np.linalg.norm(defCoorda1-defCoorda2)*np.linalg.norm(defCoorda2-defCoorda3)*np.linalg.norm(defCoorda3-defCoorda1))
+            moment = odb.steps['Step-1'].historyRegions['Surface RB'].historyOutputs['SOM2  on section RB'].data[-1][1]
+            Mx.append(moment/(x_divs*2*S*H*kppax))
+            a1 = odb.rootAssembly.nodeSets['CY-'].nodes[0][0]
+            defCoorda1 = a1.coordinates+dispField.getSubset(region=a1).values[0].data
+            a2 = odb.rootAssembly.nodeSets['C'].nodes[0][0]
+            defCoorda2 = a2.coordinates+dispField.getSubset(region=a2).values[0].data
+            a3 = odb.rootAssembly.nodeSets['CY+'].nodes[0][0]
+            defCoorda3 = a3.coordinates+dispField.getSubset(region=a3).values[0].data
+            v1 = defCoorda2-defCoorda1
+            v2 = defCoorda3-defCoorda2
+            A = np.linalg.norm(np.cross(v1,v2))/2.0
+            kppay = 4*A/(np.linalg.norm(defCoorda1-defCoorda2)*np.linalg.norm(defCoorda2-defCoorda3)*np.linalg.norm(defCoorda3-defCoorda1))
+            vbxy.append(kppay/kppax)
+        if prop == 'My':
+            moment = 0.05
+            a1 = odb.rootAssembly.nodeSets['CY-'].nodes[0][0]
+            defCoorda1 = a1.coordinates+dispField.getSubset(region=a1).values[0].data
+            a2 = odb.rootAssembly.nodeSets['C'].nodes[0][0]
+            defCoorda2 = a2.coordinates+dispField.getSubset(region=a2).values[0].data
+            a3 = odb.rootAssembly.nodeSets['CY+'].nodes[0][0]
+            defCoorda3 = a3.coordinates+dispField.getSubset(region=a3).values[0].data
+            v1 = defCoorda2-defCoorda1
+            v2 = defCoorda3-defCoorda2
+            A = np.linalg.norm(np.cross(v1,v2))/2.0
+            kppa = 4*A/(np.linalg.norm(defCoorda1-defCoorda2)*np.linalg.norm(defCoorda2-defCoorda3)*np.linalg.norm(defCoorda3-defCoorda1))
+            My.append(moment/(x_divs*2*S*H*kppa))
+        if prop == 'Txy':
+            w1 = defCoorda4[2]-defCoorda3[2]
+            w2 = defCoorda2[2]-defCoorda1[2]
+            kppa = (w2-w1)/(2*S*2*L)
+            bl = odb.rootAssembly.nodeSets['BOTTOMBACK'].nodes[0][0]
+            F = odb.steps['Step-1'].frames[-1].fieldOutputs['RF'].getSubset(region=bl).values[0].data[2]
+            moment = F*y_divs*L
+            Txy.append(moment/(y_divs*2*L*H*2*kppa))
+
+outtxt = open('detailedProp.txt', 'w+')
+outtxt.write('vxy '+str(vxy))
+outtxt.write('Ex '+str(Ex))
+outtxt.write('Ey '+str(Ey))
+outtxt.write('Gxy '+str(Gyx))
+outtxt.write('vbxy '+str(vbxy))
+outtxt.write('Mx '+str(Mx))
+outtxt.write('My '+str(My))
+outtxt.write('Txy '+str(Txy))
+outtxt.close()
