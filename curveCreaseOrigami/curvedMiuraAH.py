@@ -3,6 +3,8 @@
 Numerical implementation of asymptotic homogenization on Miura origami
 Written by: Xuwen Li, Amin Jamalimehr
 
+Reference: Xuwen Li, Amin Jamalimehr, Mathias Legrand, and Damiano Pasini. "Homogenization framework for rigid and non-rigid foldable origami metamaterials." Journal of the Mechanics and Physics of Solids (2026): 106519.
+
 Please run the following codes in Abaqus/CAE using File > Run script and select this python file,
 or run in ABAQUS command by typing: abaqus cae noGUI=asymptoticHomogenization.py
 Results are recorded in the text file effectiveConstantsAH.txt
