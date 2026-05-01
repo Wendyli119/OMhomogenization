@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Created on Fri Aug  8 12:12:27 2025
+Mesh convergence test on the effective properties of the planar Miura origami, including simulation data and plots.
+Written by: Xuwen Li
 
-@author: xli2
+Reference: Xuwen Li, Amin Jamalimehr, Mathias Legrand, and Damiano Pasini. "Homogenization framework for rigid and non-rigid foldable origami metamaterials." Journal of the Mechanics and Physics of Solids (2026): 106519.
+
+Please run the following codes using any python IDE.
 """
 
 import numpy as np
