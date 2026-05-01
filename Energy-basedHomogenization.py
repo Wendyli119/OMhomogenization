@@ -3,6 +3,8 @@
 Numerical implementation of energy-based homogenization on Miura origami
 Written by: Xuwen Li, Amin Jamalimehr
 
+Reference: Xuwen Li, Amin Jamalimehr, Mathias Legrand, and Damiano Pasini. "Homogenization framework for rigid and non-rigid foldable origami metamaterials." Journal of the Mechanics and Physics of Solids (2026): 106519.
+
 Please run the following codes in Abaqus/CAE using File > Run script and select this python file,
 or run in ABAQUS command by typing: abaqus cae noGUI=Energy-basedHomogenization.py
 Results are recorded in the text file effectiveConstantsEH.txt
@@ -471,7 +473,7 @@ for angle in foldAngles:
                 Euc = Euc + val.data
             A[i,i] = 2*Euc/Auc/strainV[i]**2
             session.odbs[JobName].close()
-        A2 = A
+        A2 = A.copy()
         # Off-diagonal terms
         for i in list(itertools.combinations(range(6),2)):
             Type = strain[i[0]]+strain[i[1]]
@@ -484,12 +486,9 @@ for angle in foldAngles:
             strainV2[0,i[0]] = 1
             strainV2[0,i[1]] = 1
             strainV2 = strainV2*strainV
-            A[i[0], i[1]] = 2*Euc/Auc - np.dot(np.dot(strainV2, A2), np.transpose(strainV2))
+            A[i[0], i[1]] = 1.0/(2*strainV2[0,i[0]]*strainV2[0,i[1]])*(2.0*Euc/Auc - np.dot(np.dot(strainV2, A2), np.transpose(strainV2)))
             A[i[1],i[0]] = A[i[0],i[1]]
             session.odbs[JobName].close()
-        Adiv = 2*np.outer(strainV, strainV)
-        np.fill_diagonal(Adiv, 1)
-        A = A/Adiv
         # Compute the compliance matrix
         SA = np.linalg.inv(A)
         # Elastic constants
